@@ -1,5 +1,7 @@
 # Reactivity - Checking reactivity of Checkpoint/LoRA to tokens
 
+![cover](./images/checkpoint.png)
+
 ## What is this?
 
 This is an extension for [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) which visualizes the reactivity of checkpoint or lora to tokens.
@@ -15,3 +17,13 @@ This is an extension for [stable-diffusion-webui](https://github.com/AUTOMATIC11
 
 - `Num. of output words`: The number of words which will be shown in tables.
 - `Batch size`: The number of tokens to be passed to CLIP text encoder at one time.
+
+## Examples
+
+### Checkpoint
+
+![checkpoint](./images/checkpoint.png)
+
+### LoRA
+
+![LoRA](./images/lora.png)
