@@ -1,6 +1,6 @@
 # =======================================================================================
 from scripts.reactivitylib.utils import ensure_install
-ensure_install('plotly')
+ensure_install('pandas')
 # =======================================================================================
 
 import sys
@@ -8,9 +8,11 @@ import math
 import traceback
 from dataclasses import dataclass
 import heapq
+import re
 from typing import List, Union, Dict, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn, Tensor
 import open_clip
@@ -29,6 +31,15 @@ from scripts.reactivitylib.utils import each_slice
 
 
 NAME = 'Reactivity'
+
+LORA_NAME_RE = re.compile(r'blocks_(\d+)_(?:1_|attn2)')
+def lora_match(x: str):
+    m = LORA_NAME_RE.search(x)
+    if m:
+        return str(m.group(1))
+    else:
+        return x
+
 
 class ClipWrapper:
     def __init__(self, te: CLIP):
@@ -64,14 +75,14 @@ class ClipWrapper:
 
 @dataclass
 class Item:
-    clip_norm: float
     token_index: int
     token: str
+    norms: List[float]
     norm_repr: float
     
     @classmethod
     def create_from(cls, this: 'Item'):
-        return cls(this.clip_norm, this.token_index, this.token, this.norm_repr)
+        return cls(this.token_index, this.token, this.norms, this.norm_repr)
 
 @dataclass
 class ItemAsc(Item):
@@ -111,7 +122,8 @@ class Queue:
             heapq.heappushpop(q, item)
 
 def compute_kv_model(unet: nn.Module, context: Tensor):
-    kvs: List[float] = []
+    names: List[str] = []
+    kvs: List[Tensor] = []
     
     for name, layer in each_unet_attn_layers(unet):
         if 'xattn' not in name:
@@ -120,23 +132,31 @@ def compute_kv_model(unet: nn.Module, context: Tensor):
         to_k = layer.to_k.to('cuda')
         to_v = layer.to_v.to('cuda')
         kv = compute_kv(to_k, to_v, context)
+        
+        names.append(name)
         kvs.append(kv)
     
-    return kvs
+    return kvs, names
 
 def compute_kv(
     to_k: nn.Module,
     to_v: nn.Module,
     context: Tensor,
-) -> float:
-    k = to_k(context)
-    v = to_v(context)
+) -> Tensor:
+    k = to_k(context) # (bs, out_ch)
+    v = to_v(context) # (bs, out_ch)
     
-    kv = torch.matmul(k.unsqueeze(1), v.unsqueeze(0))
-    return torch.linalg.matrix_norm(kv).item()
+    # kv := (bs, out_ch, 1) @ (bs, 1, out_ch)
+    #    : (bs, out_ch, out_ch)
+    kv = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
+    
+    # norms := (bs,)
+    norms = torch.linalg.matrix_norm(kv)
+    return norms
 
 def compute_kv_loras(lora_mod, context: Tensor):
-    kvs: List[float] = []
+    names: List[str] = []
+    kvs: List[Tensor] = []
     
     attn2_keys = [k for k in lora_mod.modules.keys() if '_attn2_to_k' in k]
     for to_k_key in attn2_keys:
@@ -148,20 +168,23 @@ def compute_kv_loras(lora_mod, context: Tensor):
         to_v_mod = lora_mod.modules[to_v_key]
         
         kv = compute_kv_lora(to_k_mod, to_v_mod, context)
+        
+        names.append(to_k_key.replace('_to_k', ''))
         kvs.append(kv)
 
-    return kvs
+    return kvs, names
 
 def compute_kv_lora(
     to_k, #: LoraUpDownModule,
     to_v, #: LoraUpDownModule,
     context: Tensor,
-) -> float:
-    k = apply_lora(to_k.up, to_k.down, to_k.alpha, context)
-    v = apply_lora(to_v.up, to_v.down, to_v.alpha, context)
+) -> Tensor:
+    k = apply_lora(to_k.up, to_k.down, to_k.alpha, context) # (bs, out_ch)
+    v = apply_lora(to_v.up, to_v.down, to_v.alpha, context) # (bs, out_ch)
     
-    kv = torch.matmul(k.unsqueeze(1), v.unsqueeze(0))
-    return torch.linalg.matrix_norm(kv).item()
+    kv = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
+    norms = torch.linalg.matrix_norm(kv)
+    return norms
     
 def apply_lora(
     up: nn.Module,
@@ -215,6 +238,7 @@ def run(
     q = Queue(num)
     
     #import pdb; pdb.set_trace()
+    layer_names: Union[List[str],None] = None
     for xs in tqdm.tqdm(each_slice(vocab.items(), bs), total=math.ceil(len(vocab)/bs)):
         
         if state == 'stop':
@@ -227,35 +251,29 @@ def run(
             batch.append(tokens)
             words.append((idx, word))
         
-        result = te.encode_with_transformers(torch.IntTensor(batch).to(te.wrapped.device))[:,1,:] # (bs,768)
+        embedding = te.encode_with_transformers(torch.IntTensor(batch).to(te.wrapped.device))[:,1,:] # (bs,768)
+        embedding = embedding.to('cuda')
+        emb_norms = torch.linalg.vector_norm(embedding, dim=-1) # (bs,)
         
-        clip_norms = torch.linalg.vector_norm(result, dim=-1) # (bs,)
+        if lora_mod is None:
+            kvs, names = compute_kv_model(model.model.diffusion_model, embedding)
+            names = [ x[:x.index('_')] for x in names ]
+        else:
+            kvs, names = compute_kv_loras(lora_mod, embedding)
+            names = [ lora_match(x) for x in names ]
         
-        def item(index: int):
-            clip_norm = clip_norms[index].item()
-            vector = result[index,:]
-            tidx, word = words[index]
-            
-            vector = vector.to('cuda')
-            
-            if lora_mod is None:
-                kvs = compute_kv_model(model.model.diffusion_model, vector)
-            else:
-                kvs = compute_kv_loras(lora_mod, vector)
-            
-            return Item(clip_norm, tidx, word, np.max(kvs))
-
-        #import pdb; pdb.set_trace()
+        layer_names = names
+        
+        for index in range(len(xs)):
+            token_index, token = words[index]
+            norms = [emb_norms[index].item()] + [ kv_of_each_layer[index].item() for kv_of_each_layer in kvs ]
+            norm_repr = max(norms[1:] + [0])
+            item = Item(token_index, token, norms, norm_repr)
+            q.queue(item)
+        
+    if layer_names is None:
+        return None, None
     
-        indices = torch.argsort(clip_norms)
-        for idx in indices:
-            
-            if state == 'stop':
-                return None, None
-            
-            item_ = item(int(idx.item()))
-            q.queue(item_)
-        
     asc = []
     des = []
     
@@ -264,10 +282,13 @@ def run(
     q_des = reversed(sorted(q.q_min))
     q_asc = reversed(sorted(q.q_max))
     for a, d in zip(q_asc, q_des):
-        asc.append([a.token, a.token_index, a.norm_repr])
-        des.append([d.token, d.token_index, d.norm_repr])
+        asc.append([a.token, a.token_index, a.norm_repr, *a.norms])
+        des.append([d.token, d.token_index, d.norm_repr, *d.norms])
     
-    return des, asc
+    df_des = pd.DataFrame(des, columns=['Token', 'Token Index', 'Score', 'CLIP norm']+layer_names)
+    df_asc = pd.DataFrame(asc, columns=['Token', 'Token Index', 'Score', 'CLIP norm']+layer_names)
+    
+    return df_des, df_asc
     
 
 def add_tab():
@@ -305,8 +326,8 @@ def add_tab():
             stop = gr.Button(value='Interrupt')
             close = gr.Button(value='Close')
         
-        result1 = gr.Dataframe(headers=['Token', 'Token Index', 'Score'], datatype=['str', 'number', 'number'], type='array', label='Maximum', interactive=False)
-        result2 = gr.Dataframe(headers=['Token', 'Token Index', 'Score'], datatype=['str', 'number', 'number'], type='array', label='Minimum', interactive=False)
+        result1 = gr.Dataframe(max_rows=None, label='Maximum', interactive=False)
+        result2 = gr.Dataframe(max_rows=None, label='Minimum', interactive=False)
     
         def close_fn():
             return None, None
